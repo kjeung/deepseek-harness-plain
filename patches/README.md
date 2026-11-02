@@ -7,7 +7,7 @@
 
 | 文件 | 说明 |
 |---|---|
-| `0001-feat-deepseek-harness-replace-Caddy-with-plain-HTTP-.patch` | 单个 `git format-patch` 补丁，含 10 个文件、1030 增 / 186 删（Caddyfile 删除、node-proxy.mjs 新增等） |
+| `000*.patch` | `git format-patch` 导出（每个提交一个文件，按顺序 `git am` 即可）：改造提交 + 上游同步 workflow |
 | `plain-http.bundle` | 同一个提交的 thin bundle（~15 KB），需要 `patches/BASE` 记录的基线提交已存在于本地 |
 | `BASE` | 补丁基线（上游 `dev` 的完整 sha），由同步脚本维护 |
 

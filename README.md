@@ -67,8 +67,9 @@ git -C runtime checkout plain-http
 补丁的基线、校验方式、推到自有 fork 等细节见 [patches/README.md](patches/README.md)；
 上游更新后如何同步见 [SYNC-UPSTREAM.md](SYNC-UPSTREAM.md)（一行命令：`scripts/sync-upstream.sh`）。
 
-镜像源码的 fork：**https://github.com/kjeung/runtime**（分支 `plain-http`，保留完整上游历史，
-可直接用 GitHub 的 Sync fork / PR）。部署仓库：**https://github.com/kjeung/deepseek-harness-plain**。
+镜像源码的 fork：**https://github.com/kjeung/runtime**（默认分支 `plain-http`，保留完整上游历史）。
+它带一个**每日定时工作流**：上游 `dev` 前进时自动 merge 到 `sync/upstream-<sha>` 并向 `plain-http` 开 PR，
+冲突则开 issue（细节见 SYNC-UPSTREAM.md §6）。部署仓库：**https://github.com/kjeung/deepseek-harness-plain**。
 
 ```bash
 cp .env.example .env
@@ -198,7 +199,13 @@ curl -fsS http://127.0.0.1:8080/healthz   # {"ok":true,"backend":200}
 - **进程模型**：`tini` 是 PID 1，dsh 与转发进程任一退出整个容器即退出 → `restart: unless-stopped` 必需。
 - **优雅退出**：SIGTERM → 转发进程立即停止接收新连接并断开 WebSocket，随后最多等 5 s 让普通响应/流收尾，然后退出 0；
   `stop_grace_period: 30s` 足够。长时间运行的 Agent 任务会被中断（与旧镜像一致，重启前请确认没有关键任务）。
-- **升级**：改 `DSH_VERSION` 后 `docker compose build && docker compose up -d`；升级前先备份。
+- **升级（含 dsh 版本升级，务必看风险）**：只改小版本（同一 dsh）时 `docker compose build && docker compose up -d` 即可，升级前备份。
+  升级 **dsh 版本**不是改个数字：镜像构建期补丁用精确字符串匹配 `isAuthenticated()`，DSH 源码一变构建就会失败；
+  DSH 的 WebSocket 路径、`/api` 栅栏、gzip、300 MiB 上限也可能变化。完整清单见
+  [SYNC-UPSTREAM.md §5](SYNC-UPSTREAM.md#5-dsh-版本升级最需要注意的一步)，要点：
+  1. 同步上游并重新应用/修正 `patch-dsh-authenticated-settings.mjs` 的匹配字符串；
+  2. 三处版本号保持一致：`docker-compose.yml` 的 `DSH_VERSION`、`.env.example`、`runtime/.github/workflows/` 默认值；
+  3. 构建后跑端到端（`/healthz`、settings、WebSocket、SSE），再发布。
 
 ## 6. 排障
 
@@ -208,6 +215,7 @@ curl -fsS http://127.0.0.1:8080/healthz   # {"ok":true,"backend":200}
 | `401 unauthorized`、容器起不来、日志 `did not become ready` | 镜像补丁丢失或被去掉（`ONEPANEL_DSH_AUTH_PROXY`/`isAuthenticated` 补丁）。必须保留。 |
 | 502 | 后端 dsh 未起/已崩；转发进程会在日志里记 502。 |
 | UI 能打开但永远不刷新、任务无输出 | 外部反代没有转发 WebSocket 升级（缺 `Upgrade`/`Connection` 头）。 |
+| 镜像构建失败：`unexpected browser proxy authentication source shape` / `unexpected PDF worker source shape` | dsh 版本变了，构建期补丁的精确字符串不再匹配。按 [SYNC-UPSTREAM.md §5](SYNC-UPSTREAM.md#5-dsh-版本升级最需要注意的一步) 更新 `patch-dsh-authenticated-settings.mjs`，再跑端到端验证。 |
 | 流式输出变成一次性出现 | 外部反代或中间层缓冲了响应（`proxy_buffering off`、别加 gzip 中间件）。 |
 | 上传文件 413 | 外部反代 `client_max_body_size` 太小（需 ≥300 MiB）。 |
 | 请求返回 400 `Host must not end with a dot` | 上游反代发来了 FQDN 尾点 Host（`dsh.example.com.`）。DSH 会 403 这种 Host，所以这里提前 400；请让反代用 `$http_host`（不带结尾点）。 |

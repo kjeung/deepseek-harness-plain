@@ -14,6 +14,8 @@
 ```bash
 # fork 上游（服务端创建，带完整历史；无需上传历史对象）
 gh repo fork 1Panel-dev/runtime --clone=false          # -> kjeung/runtime
+# fork 的默认分支设为 plain-http（定时同步工作流只在默认分支运行）
+gh api -X PATCH repos/kjeung/runtime -f default_branch=plain-http
 # 本地 runtime/ 的 remote 约定：
 #   origin   = https://github.com/kjeung/runtime.git      （我们的 fork）
 #   upstream = https://github.com/1Panel-dev/runtime.git  （上游）
@@ -114,20 +116,39 @@ curl -fsS -X POST -H 'Content-Type: application/json' -H 'Host: example.test' \
 node prototype/ws-test.mjs 8096 example.test http://example.test   # 期望 101
 ```
 
-## 6. 可选：GitHub 上直接同步 fork
+## 6. 自动化：上游更新自动开 PR（已启用）
 
-fork `kjeung/runtime` 与上游的 `dev` 可以用网页 **Sync fork** 或命令行：
+fork `kjeung/runtime` 里有一个定时工作流 **`.github/workflows/sync-upstream.yml`**
+
+- **触发**：每天 03:17 UTC（`schedule`）+ 手动 `workflow_dispatch`；
+- **判断**：`git fetch upstream dev`，若 `plain-http` 已包含 `upstream/dev` 就结束；
+- **做法**：把 `upstream/dev` **merge** 到临时分支 `sync/upstream-<sha>`，跑自检后 push，并向
+  `plain-http` 开 **PR**（PR 里列出上游新提交、dsh 版本漂移警告、合并后要做的事）；
+- **冲突**：自动中止 merge，改开 **issue**「upstream dev@<sha> needs a manual merge」，附冲突文件清单；
+- **已有 PR/issue**：不会重复开。
+
+为什么用 merge 而不是 rebase：rebase 后的分支与 `plain-http` **没有祖先关系**，PR 合并会产生重复提交；
+merge 提交则让 PR 可 fast-forward 合并。若你更在意线性历史，本地跑 `scripts/sync-upstream.sh`（rebase）即可——
+之后再执行一次 rebase 会自动丢掉这些 merge 提交，两种模式可以共存。
+
+> 为了让 `schedule` 生效，fork 的**默认分支已改为 `plain-http`**（GitHub 只在默认分支跑定时工作流）。
+> 副作用：网页上的 **Sync fork** 按钮现在等价于「把 upstream/dev merge 进 plain-http」，与工作流同一模型。
+
+**PR 合并之后**（plain-http 前进到新上游）：
 
 ```bash
-gh repo sync kjeung/runtime --source 1Panel-dev/runtime --branch dev
+scripts/sync-upstream.sh --repo ../dsh-plain --push   # 刷新部署仓库快照 + patches
 ```
 
-但它只更新 fork 的 `dev` 分支，**不会**把 `plain-http` 重新 rebase。
-rebase + 测试 + 补丁导出仍要用上面的脚本（脚本直接从 upstream fetch，不依赖 fork 的 dev 是否已同步）。
+工作流不会自动改部署仓库（跨仓库写需要额外 PAT），这一步必须跑脚本或手动同步。
 
 ## 7. 验证同步结果
 
 ```bash
+# 自动化状态
+gh run list --repo kjeung/runtime --workflow sync-upstream.yml --limit 3
+gh pr list --repo kjeung/runtime --base plain-http --state open
+# 本地源码
 git -C runtime log --oneline -3
 git -C runtime rev-parse upstream/dev plain-http
 cat patches/BASE                       # 补丁基线

@@ -1,0 +1,162 @@
+name: Sync upstream dev
+
+# On a schedule (and on demand) check whether 1Panel-dev/runtime's `dev` moved.
+# If it did, merge upstream/dev into a review branch and open a PR against
+# `plain-http`. The PR is a fast-forwardable merge (base is an ancestor of the
+# head), so "Merge pull request" advances plain-http without rewriting history.
+#
+# A separate PR file could not be used with a rebase: a rebased branch has no
+# ancestor relationship with its base, and merging it would duplicate commits.
+# If you prefer linear history, run scripts/sync-upstream.sh locally instead
+# (it rebases and force-pushes) — a later rebase also drops these merge commits.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout plain-http
+        uses: actions/checkout@v6
+        with:
+          ref: plain-http
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream dev and classify
+        id: classify
+        run: |
+          git remote add upstream https://github.com/1Panel-dev/runtime.git
+          git fetch --no-tags upstream dev
+          UP="$(git rev-parse upstream/dev)"
+          echo "up=$UP" >> "$GITHUB_OUTPUT"
+          echo "short=${UP:0:7}" >> "$GITHUB_OUTPUT"
+          git log --oneline HEAD..upstream/dev > "$RUNNER_TEMP/upstream-commits.txt" || true
+          wc -l < "$RUNNER_TEMP/upstream-commits.txt" | tr -d ' ' > "$RUNNER_TEMP/upstream-count.txt"
+          if git merge-base --is-ancestor "$UP" HEAD; then
+            echo "state=up-to-date" >> "$GITHUB_OUTPUT"
+          else
+            echo "state=behind" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Report current state
+        run: |
+          echo "upstream/dev = ${{ steps.classify.outputs.up }}"
+          echo "state        = ${{ steps.classify.outputs.state }}"
+          cat "$RUNNER_TEMP/upstream-commits.txt" || true
+
+      - name: Skip when a sync PR is already open
+        id: openpr
+        if: steps.classify.outputs.state == 'behind'
+        run: |
+          count="$(gh pr list --base plain-http --state open --json headRefName \
+            --jq '[.[] | select(.headRefName | startswith("sync/upstream-"))] | length')"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+      - name: Merge upstream into a review branch
+        id: merge
+        if: steps.classify.outputs.state == 'behind' && steps.openpr.outputs.count == '0'
+        run: |
+          branch="sync/upstream-${{ steps.classify.outputs.short }}"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          git switch -c "$branch"
+          if git merge --no-ff \
+              -m "chore: merge upstream dev@${{ steps.classify.outputs.short }} into plain-http" \
+              upstream/dev; then
+            echo "merged=1" >> "$GITHUB_OUTPUT"
+          else
+            git merge --abort || true
+            echo "merged=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Self-tests on the merged tree
+        if: steps.merge.outputs.merged == '1'
+        run: |
+          node --check deepseek-harness/node-proxy.mjs
+          node deepseek-harness/node-proxy.mjs --self-test
+          bash deepseek-harness/docker-entrypoint.sh --self-test
+          workflow_dsh="$(grep -m1 'default: "' .github/workflows/deepseek-harness-release.yml | sed 's/.*default: "//; s/".*//')"
+          dockerfile_dsh="$(sed -n 's/^ARG DSH_VERSION=//p' deepseek-harness/Dockerfile | head -1)"
+          echo "release workflow dsh=${workflow_dsh:-unknown} Dockerfile ARG=${dockerfile_dsh:-unknown}"
+          if [ -n "$dockerfile_dsh" ] && [ "$workflow_dsh" != "$dockerfile_dsh" ]; then
+            echo "::warning::dsh version drift: workflow=$workflow_dsh Dockerfile=$dockerfile_dsh — align them and the deployment compose/.env, see SYNC-UPSTREAM.md §5"
+          fi
+
+      - name: Push review branch and open PR
+        id: pr
+        if: steps.merge.outputs.merged == '1'
+        run: |
+          branch="${{ steps.merge.outputs.branch }}"
+          short="${{ steps.classify.outputs.short }}"
+          git push --force origin "$branch"
+          if gh pr list --head "$branch" --state open --json number --jq '.[0].number' | grep -q .; then
+            echo "PR already open for $branch"
+            exit 0
+          fi
+          {
+            echo "Automated sync: upstream \`dev\` moved to [\`$short\`](https://github.com/1Panel-dev/runtime/commit/${{ steps.classify.outputs.up }})."
+            echo
+            echo "This branch is \`upstream/dev\` merged into \`plain-http\`; the merge is conflict-free."
+            echo "**Merge this PR to advance \`plain-http\`** (base is an ancestor, so no history rewrite)."
+            echo
+            echo "### Upstream commits included"
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/upstream-commits.txt"
+            echo '```'
+            echo
+            echo "### After merging"
+            echo
+            echo "1. Refresh the deployment snapshot: \`scripts/sync-upstream.sh --repo <dsh-plain clone> --push\`"
+            echo "2. Re-check dsh version drift and the auth-bypass patch (see SYNC-UPSTREAM.md §5)"
+            echo "3. Build/run the image and smoke-test \`/healthz\`, settings, WebSocket"
+          } > "$RUNNER_TEMP/pr-body.md"
+          gh pr create --base plain-http --head "$branch" \
+            --title "chore: sync upstream dev@$short" \
+            --body-file "$RUNNER_TEMP/pr-body.md"
+
+      - name: Open an issue when the merge conflicts
+        if: steps.merge.outputs.merged == '0'
+        run: |
+          short="${{ steps.classify.outputs.short }}"
+          if gh issue list --state open --json title --jq '.[].title' | grep -q "upstream dev@$short"; then
+            echo "issue already open"
+            exit 0
+          fi
+          {
+            echo "Upstream \`dev\` moved to [\`$short\`](https://github.com/1Panel-dev/runtime/commit/${{ steps.classify.outputs.up }}) and the automatic merge conflicted."
+            echo
+            echo "Resolve locally, then push the result:"
+            echo '```bash'
+            echo "cd runtime && git fetch upstream dev && git switch plain-http"
+            echo "git merge upstream/dev     # resolve conflicts"
+            echo "scripts/sync-upstream.sh --repo ../dsh-plain --push   # or just commit + push"
+            echo '```'
+            echo
+            echo "Conflicts are expected in: \`Dockerfile\`, \`docker-entrypoint.sh\`, \`test-runtime.mjs\`, "
+            echo "\`patch-dsh-authenticated-settings.mjs\`, \`.github/workflows/deepseek-harness-release.yml\`."
+            echo
+            echo "Upstream commits:"
+            echo '```'
+            cat "$RUNNER_TEMP/upstream-commits.txt"
+            echo '```'
+          } > "$RUNNER_TEMP/issue-body.md"
+          gh issue create --title "upstream dev@$short needs a manual merge" --body-file "$RUNNER_TEMP/issue-body.md"
