@@ -1,0 +1,62 @@
+From a4db4ab0b9eec0adc61ae18330bac77e3a69459f Mon Sep 17 00:00:00 2001
+From: DSH deployment <dsh-deployment@localhost>
+Date: Mon, 2 Nov 2026 08:37:23 +0000
+Subject: [PATCH 3/3] ci(sync-upstream): make skipped merge step impossible to
+ confuse, set explicit MERGED state
+
+---
+ .github/workflows/sync-upstream.yml | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/.github/workflows/sync-upstream.yml b/.github/workflows/sync-upstream.yml
+index a6299a1..fa2ea01 100644
+--- a/.github/workflows/sync-upstream.yml
++++ b/.github/workflows/sync-upstream.yml
+@@ -56,6 +56,9 @@ jobs:
+           else
+             echo "state=behind" >> "$GITHUB_OUTPUT"
+           fi
++          # Explicit default: a skipped merge step leaves its output empty, and
++          # GitHub's loose == would treat empty as '0'. Never rely on that.
++          echo "MERGED=none" >> "$GITHUB_ENV"
+ 
+       - name: Report current state
+         run: |
+@@ -82,13 +85,15 @@ jobs:
+               -m "chore: merge upstream dev@${{ steps.classify.outputs.short }} into plain-http" \
+               upstream/dev; then
+             echo "merged=1" >> "$GITHUB_OUTPUT"
++            echo "MERGED=1" >> "$GITHUB_ENV"
+           else
+             git merge --abort || true
+             echo "merged=0" >> "$GITHUB_OUTPUT"
++            echo "MERGED=0" >> "$GITHUB_ENV"
+           fi
+ 
+       - name: Self-tests on the merged tree
+-        if: steps.merge.outputs.merged == '1'
++        if: env.MERGED == '1'
+         run: |
+           node --check deepseek-harness/node-proxy.mjs
+           node deepseek-harness/node-proxy.mjs --self-test
+@@ -102,7 +107,7 @@ jobs:
+ 
+       - name: Push review branch and open PR
+         id: pr
+-        if: steps.merge.outputs.merged == '1'
++        if: env.MERGED == '1'
+         run: |
+           branch="${{ steps.merge.outputs.branch }}"
+           short="${{ steps.classify.outputs.short }}"
+@@ -134,7 +139,7 @@ jobs:
+             --body-file "$RUNNER_TEMP/pr-body.md"
+ 
+       - name: Open an issue when the merge conflicts
+-        if: steps.merge.outputs.merged == '0'
++        if: env.MERGED == '0'
+         run: |
+           short="${{ steps.classify.outputs.short }}"
+           if gh issue list --state open --json title --jq '.[].title' | grep -q "upstream dev@$short"; then
+-- 
+2.47.3
+

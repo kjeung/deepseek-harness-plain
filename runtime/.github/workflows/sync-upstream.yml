@@ -56,6 +56,9 @@ jobs:
           else
             echo "state=behind" >> "$GITHUB_OUTPUT"
           fi
+          # Explicit default: a skipped merge step leaves its output empty, and
+          # GitHub's loose == would treat empty as '0'. Never rely on that.
+          echo "MERGED=none" >> "$GITHUB_ENV"
 
       - name: Report current state
         run: |
@@ -82,13 +85,15 @@ jobs:
               -m "chore: merge upstream dev@${{ steps.classify.outputs.short }} into plain-http" \
               upstream/dev; then
             echo "merged=1" >> "$GITHUB_OUTPUT"
+            echo "MERGED=1" >> "$GITHUB_ENV"
           else
             git merge --abort || true
             echo "merged=0" >> "$GITHUB_OUTPUT"
+            echo "MERGED=0" >> "$GITHUB_ENV"
           fi
 
       - name: Self-tests on the merged tree
-        if: steps.merge.outputs.merged == '1'
+        if: env.MERGED == '1'
         run: |
           node --check deepseek-harness/node-proxy.mjs
           node deepseek-harness/node-proxy.mjs --self-test
@@ -102,7 +107,7 @@ jobs:
 
       - name: Push review branch and open PR
         id: pr
-        if: steps.merge.outputs.merged == '1'
+        if: env.MERGED == '1'
         run: |
           branch="${{ steps.merge.outputs.branch }}"
           short="${{ steps.classify.outputs.short }}"
@@ -134,7 +139,7 @@ jobs:
             --body-file "$RUNNER_TEMP/pr-body.md"
 
       - name: Open an issue when the merge conflicts
-        if: steps.merge.outputs.merged == '0'
+        if: env.MERGED == '0'
         run: |
           short="${{ steps.classify.outputs.short }}"
           if gh issue list --state open --json title --jq '.[].title' | grep -q "upstream dev@$short"; then

@@ -1,7 +1,7 @@
 From 7af07869a426ece8762b2fe4a19d356d7fa9dee7 Mon Sep 17 00:00:00 2001
 From: DSH deployment <dsh-deployment@localhost>
 Date: Mon, 2 Nov 2026 08:35:05 +0000
-Subject: [PATCH 2/2] ci: daily upstream sync with automatic review PR
+Subject: [PATCH 2/3] ci: daily upstream sync with automatic review PR
 
 Checks 1Panel-dev/runtime dev on a schedule; when it moves, merges it into a
 sync/upstream-<sha> branch and opens a PR against plain-http. Merge conflicts
