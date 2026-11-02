@@ -1,0 +1,83 @@
+# DeepSeek Harness —— 明文 HTTP 版（无登录、无 TLS、无 Caddy）
+#
+# 架构：浏览器 → 你的外部反向代理（负责登录认证 + TLS）→ 本容器 8080（Node 转发，无认证）
+#       → 容器内 127.0.0.1:3080（dsh web）
+#
+# 安全前提：容器内**没有任何认证**。8080 端口只能让外部反代访问，
+# 默认只发布到宿主机 127.0.0.1，切勿改成 0.0.0.0 暴露到不可信网络。
+#
+# 用法：
+#   cp .env.example .env        # 只需填 DSH_ACCESS_HOST
+#   docker compose up -d --build
+#   docker compose logs -f      # 出现 "available at http://<host>:8080" 即就绪
+
+name: deepseek-harness
+
+services:
+  deepseek-harness:
+    # 默认从 ./runtime 源码构建；该目录必须是「上游 clone + patches/ 里的改造补丁」
+    # （见 patches/README.md）。直接 clone 上游得到的是 Caddy/HTTPS 原版，不能这样用。
+    # 若要使用已构建好的镜像，设置 DSH_IMAGE 并删掉 build + pull_policy 段。
+    image: ${DSH_IMAGE:-deepseek-harness:plain}
+    # 同时出现 image 与 build 时，Compose 默认「先 pull，pull 不到才 build」，
+    # 因此显式声明总是构建；要用已构建镜像请删掉整个 build 段。
+    pull_policy: build
+    build:
+      context: ./runtime
+      dockerfile: deepseek-harness/Dockerfile
+      args:
+        DSH_VERSION: ${DSH_VERSION:-0.2.1-rc.5}
+    container_name: deepseek-harness
+    restart: unless-stopped
+
+    # 不要设置 user:，入口脚本需要 root 修正 /data、/workspace 属主，
+    # 随后以 node(1000) 身份降权运行 dsh 与反代。
+    environment:
+      # 必填：浏览器实际访问的主机名/IPv4（不带协议和端口）。
+      # 它同时是 dsh 的 --trusted-host（/api 的 Host 白名单）与反代的 Host 白名单。
+      # 留空也能启动 compose，但容器会在入口校验阶段报错退出（错误信息更明确）。
+      DSH_ACCESS_HOST: ${DSH_ACCESS_HOST:-}
+      # 旧变量名兼容：两者都转发，入口脚本优先用 DSH_ACCESS_HOST。
+      HTTPS_ACCESS_HOST: ${HTTPS_ACCESS_HOST:-}
+      # 可选：要求外部反代带 X-DSH-Proxy-Secret 头才转发（纵深防御，不是认证）
+      PROXY_SHARED_SECRET: ${PROXY_SHARED_SECRET:-}
+      # 访问日志（JSON 行，只记 pathname 不记 query；置 0 关闭）
+      PROXY_ACCESS_LOG: ${PROXY_ACCESS_LOG:-1}
+      #
+      # 可选：dsh 应用层变量（.env 里取消注释后，这里也要取消对应行才会进容器）
+      # DSH_PERMISSION_MODE: ${DSH_PERMISSION_MODE:-workspace-write}
+      # DSH_TOOLS_MODE: ${DSH_TOOLS_MODE:-native}
+      # DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      # DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-}
+      # HTTP_PROXY: ${HTTP_PROXY:-}
+      # HTTPS_PROXY: ${HTTPS_PROXY:-}
+      # NO_PROXY: ${NO_PROXY:-}
+
+    ports:
+      # 只发布到宿主机回环：外部反代若在同机，从 127.0.0.1:8080 回源。
+      # 若外部反代在另一个容器，请删掉这行、改用共享 docker 网络并只 expose。
+      - "127.0.0.1:${DSH_HTTP_PORT:-8080}:8080"
+
+    volumes:
+      # DSH 运行数据：profiles、settings.yaml、.credentials.yaml、会话、日志（必须持久化）
+      - ${DSH_DATA_DIR:-./data/dsh}:/data/dsh
+      # Agent 工作目录（沙箱 workspaceRoot）
+      - ${WORKSPACE_DIR:-./workspace}:/workspace
+
+    # /healthz 会同时探测反代与后端 dsh；入口脚本先等 dsh 就绪再起反代，
+    # 冷启动最多 60 秒，因此 start_period 放宽。
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS --noproxy '*' --max-time 5 http://127.0.0.1:8080/healthz >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 180s
+
+    # 给 dsh 与反代留出优雅退出时间（tini 转发 SIGTERM）
+    stop_grace_period: 30s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

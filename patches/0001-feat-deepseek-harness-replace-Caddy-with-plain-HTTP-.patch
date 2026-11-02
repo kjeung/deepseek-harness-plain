@@ -1,0 +1,1463 @@
+From e0d84419c61d65a78170c5f528804311887fcb58 Mon Sep 17 00:00:00 2001
+From: DSH deployment <dsh-deployment@localhost>
+Date: Mon, 2 Nov 2026 08:13:44 +0000
+Subject: [PATCH] feat(deepseek-harness): replace Caddy with plain-HTTP Node
+ proxy
+
+- drop Caddy, TLS, internal CA and basic auth: the container now serves
+  plain HTTP on 8080 and expects an authenticated TLS reverse proxy in front
+- add node-proxy.mjs: Host allowlist, security headers, JSON access log,
+  /healthz, optional shared secret, WebSocket passthrough, streaming, 502/504
+- entrypoint: remove username/password validation and argon2 hashing, keep
+  uid/gid fixups, readiness wait, --trusted-host and the DSH auth bypass patch
+- keep DSH_ACCESS_HOST (HTTPS_ACCESS_HOST accepted with deprecation warning)
+- tests: replace the Caddy test with 14 proxy tests
+- release workflow: publish the plain-HTTP variant to its own repository
+  (1panel/deepseek-harness-plain) instead of overwriting the Caddy image tags
+---
+ .dockerignore                                 |   6 +
+ .../workflows/deepseek-harness-release.yml    |  47 +-
+ README.md                                     |   2 +-
+ README_zh.md                                  |   2 +-
+ deepseek-harness/Caddyfile                    |  45 --
+ deepseek-harness/Dockerfile                   |  30 +-
+ deepseek-harness/docker-entrypoint.sh         |  55 +-
+ deepseek-harness/node-proxy.mjs               | 486 ++++++++++++++++
+ .../patch-dsh-authenticated-settings.mjs      |   3 +-
+ deepseek-harness/test-runtime.mjs             | 540 +++++++++++++++---
+ 10 files changed, 1030 insertions(+), 186 deletions(-)
+ create mode 100644 .dockerignore
+ delete mode 100644 deepseek-harness/Caddyfile
+ create mode 100644 deepseek-harness/node-proxy.mjs
+
+diff --git a/.dockerignore b/.dockerignore
+new file mode 100644
+index 0000000..d1948ae
+--- /dev/null
++++ b/.dockerignore
+@@ -0,0 +1,6 @@
++# Keep the build context small; every image in this repository is built from the
++# repository root and only copies the directory named by its own Dockerfile.
++.git
++.github
++.gitignore
++**/.DS_Store
+diff --git a/.github/workflows/deepseek-harness-release.yml b/.github/workflows/deepseek-harness-release.yml
+index efc8687..1cdd681 100644
+--- a/.github/workflows/deepseek-harness-release.yml
++++ b/.github/workflows/deepseek-harness-release.yml
+@@ -1,6 +1,11 @@
+-name: Build DeepSeek Harness Image
+-run-name: Build DeepSeek Harness Image ${{ github.event.inputs.dshVersion }}
++name: Build DeepSeek Harness Image (plain HTTP)
++run-name: Build DeepSeek Harness Image ${{ inputs.dshVersion }}
+ 
++# This image terminates no TLS and performs no authentication: it must run behind
++# an authenticated TLS reverse proxy, listening on plain-HTTP 8080. It is therefore
++# published under its OWN repository name and alias, never as
++# 1panel/deepseek-harness:<version> or :latest — that would silently replace the
++# Caddy/HTTPS image with a different security model.
+ on:
+   workflow_dispatch:
+     inputs:
+@@ -12,14 +17,17 @@ on:
+         description: "Platforms"
+         default: "linux/amd64,linux/arm64"
+         required: true
+-      pushLatest:
+-        description: "Push latest tag"
++      imageName:
++        description: "Target image repository (plain-HTTP variant, not the Caddy image)"
++        default: "1panel/deepseek-harness-plain"
++        required: true
++      pushAlias:
++        description: "Also tag the alias ':plain' (in addition to ':<dshVersion>')"
+         default: "true"
+         required: true
+ 
+ env:
+   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+-  IMAGE_NAME: 1panel/deepseek-harness
+ 
+ jobs:
+   docker:
+@@ -41,30 +49,25 @@ jobs:
+           password: ${{ secrets.DOCKERHUB_PASSWORD }}
+ 
+       - name: Build and push image
++        id: build
+         uses: docker/build-push-action@v7
+         with:
+           context: .
+           file: deepseek-harness/Dockerfile
+-          platforms: ${{ github.event.inputs.platforms }}
++          platforms: ${{ inputs.platforms }}
+           push: true
+           build-args: |
+-            DSH_VERSION=${{ github.event.inputs.dshVersion }}
++            DSH_VERSION=${{ inputs.dshVersion }}
+           tags: |
+-            ${{ env.IMAGE_NAME }}:${{ github.event.inputs.dshVersion }}
++            ${{ inputs.imageName }}:${{ inputs.dshVersion }}
+           cache-from: type=gha,scope=deepseek-harness
+           cache-to: type=gha,mode=max,scope=deepseek-harness
+ 
+-      - name: Push latest tag
+-        if: ${{ github.event.inputs.pushLatest == 'true' }}
+-        uses: docker/build-push-action@v7
+-        with:
+-          context: .
+-          file: deepseek-harness/Dockerfile
+-          platforms: ${{ github.event.inputs.platforms }}
+-          push: true
+-          build-args: |
+-            DSH_VERSION=${{ github.event.inputs.dshVersion }}
+-          tags: |
+-            ${{ env.IMAGE_NAME }}:latest
+-          cache-from: type=gha,scope=deepseek-harness
+-          cache-to: type=gha,mode=max,scope=deepseek-harness
++      # Alias the immutable version tag instead of running a second build, so both
++      # tags always resolve to the same multi-arch digest.
++      - name: Push plain alias
++        if: ${{ inputs.pushAlias == 'true' }}
++        run: |
++          docker buildx imagetools create \
++            --tag "${{ inputs.imageName }}:plain" \
++            "${{ inputs.imageName }}:${{ inputs.dshVersion }}"
+diff --git a/README.md b/README.md
+index 1736ffd..cde3a90 100644
+--- a/README.md
++++ b/README.md
+@@ -18,7 +18,7 @@ Current images in this repository:
+ ## Images
+ 
+ - `1panel/comfyui`: ComfyUI runtime image for NVIDIA GPUs, built from matching upstream stable releases
+-- `1panel/deepseek-harness`: DeepSeek Harness image maintained by 1Panel with HTTPS access and persistent runtime data
++- `1panel/deepseek-harness`: DeepSeek Harness image with a plain-HTTP Node forwarding proxy, meant to run behind an authenticated TLS reverse proxy
+ - `1panel/hermes-agent`: Hermes Agent runtime image maintained by 1Panel with bundled messaging channel dependencies
+ - `1panel/openclaw`: OpenClaw runtime image built from official source with 1Panel-oriented customizations
+ - `1panel/vllm-gb10-dspark`: ARM64 vLLM runtime for DeepSeek V4 Flash on two NVIDIA GB10 nodes
+diff --git a/README_zh.md b/README_zh.md
+index 10b0d56..8654e6f 100644
+--- a/README_zh.md
++++ b/README_zh.md
+@@ -18,7 +18,7 @@
+ ## 镜像说明
+ 
+ - `1panel/comfyui`：面向 NVIDIA GPU、严格基于上游稳定 Release 构建的 ComfyUI 运行环境镜像
+-- `1panel/deepseek-harness`：由 1Panel 维护的 DeepSeek Harness 镜像，提供 HTTPS 访问和运行数据持久化
++- `1panel/deepseek-harness`：内置明文 HTTP Node 转发代理的 DeepSeek Harness 镜像，需放在已完成认证与 TLS 的反向代理之后
+ - `1panel/hermes-agent`：1Panel 维护的 Hermes Agent 运行环境镜像，内置消息通道相关依赖
+ - `1panel/openclaw`：基于 OpenClaw 官方源码构建的运行环境镜像，包含面向 1Panel 场景的定制
+ - `1panel/vllm-gb10-dspark`：用于在两台 NVIDIA GB10 节点上部署 DeepSeek V4 Flash 的 ARM64 vLLM 运行环境镜像
+diff --git a/deepseek-harness/Caddyfile b/deepseek-harness/Caddyfile
+deleted file mode 100644
+index fe507d1..0000000
+--- a/deepseek-harness/Caddyfile
++++ /dev/null
+@@ -1,45 +0,0 @@
+-{
+-	admin off
+-	auto_https disable_redirects
+-	default_sni {$CADDY_ACCESS_HOST}
+-	skip_install_trust
+-}
+-
+-https://{$CADDY_ACCESS_HOST}:8443 {
+-	tls internal
+-	encode zstd gzip
+-
+-	basic_auth argon2id {
+-		{$DSH_AUTH_USERNAME} {$DSH_AUTH_PASSWORD_HASH}
+-	}
+-
+-	header {
+-		X-Content-Type-Options "nosniff"
+-		Referrer-Policy "same-origin"
+-		-Server
+-	}
+-
+-	@unsafe_api {
+-		path /api /api/*
+-		expression `({http.request.header.Origin} != "" && {http.request.header.Origin} != "https://" + {http.request.hostport}) || {http.request.header.Sec-Fetch-Site} == "cross-site"`
+-	}
+-	@settings_api path /api/settings/describe /api/settings/update /api/settings/replace /api/settings/mutate /api/credentials/describe /api/credentials/set /api/credentials/unset /api/llm/discoverModels
+-
+-	route @unsafe_api {
+-		respond "Forbidden" 403
+-	}
+-
+-	route @settings_api {
+-		reverse_proxy 127.0.0.1:3080 {
+-			header_up Host 127.0.0.1:3080
+-			header_up -Origin
+-			header_up -Authorization
+-		}
+-	}
+-
+-	route {
+-		reverse_proxy 127.0.0.1:3080 {
+-			header_up -Authorization
+-		}
+-	}
+-}
+diff --git a/deepseek-harness/Dockerfile b/deepseek-harness/Dockerfile
+index 6683567..12bd006 100644
+--- a/deepseek-harness/Dockerfile
++++ b/deepseek-harness/Dockerfile
+@@ -1,8 +1,6 @@
+-FROM caddy:2.11.4 AS caddy
+-
+ FROM node:24-bookworm-slim AS dsh-builder
+ 
+-ARG DSH_VERSION=0.2.1-rc.2
++ARG DSH_VERSION=0.2.1-rc.5
+ 
+ RUN apt-get update && \
+     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+@@ -20,11 +18,14 @@ RUN npm install --prefix /tmp/dsh-browser-compat --no-audit --no-fund \
+ FROM node:24-bookworm-slim
+ 
+ ARG PNPM_VERSION=11.7.0
++# Re-declared so the version is recorded as image metadata as well.
++ARG DSH_VERSION=0.2.1-rc.5
+ 
+ LABEL org.opencontainers.image.source="https://github.com/1Panel-dev/runtime" \
+       org.opencontainers.image.url="https://github.com/deepseek-ai/deepseek-harness" \
+       org.opencontainers.image.title="1Panel DeepSeek Harness" \
+-      org.opencontainers.image.description="DeepSeek Harness image maintained by 1Panel with HTTPS access and persistent runtime data" \
++      org.opencontainers.image.description="DeepSeek Harness image maintained by 1Panel with plain HTTP access, meant to run behind an authenticated TLS reverse proxy" \
++      org.opencontainers.image.version="${DSH_VERSION}" \
+       org.opencontainers.image.vendor="1Panel"
+ 
+ RUN apt-get update && \
+@@ -40,30 +41,27 @@ RUN apt-get update && \
+       tini && \
+     rm -rf /var/lib/apt/lists/*
+ 
+-COPY --from=caddy /usr/bin/caddy /usr/bin/caddy
+ COPY --from=dsh-builder /usr/local/lib/node_modules /usr/local/lib/node_modules
+ 
+ RUN node --expose-internals /usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js \
+       --help >/dev/null && \
+-    groupadd --system --gid 1001 caddy && \
+-    useradd --system --uid 1001 --gid caddy --home-dir /var/lib/caddy \
+-      --create-home --shell /usr/sbin/nologin caddy && \
+     install -d -m 0700 -o node -g node /data/dsh /data/dsh/home && \
+-    install -d -m 0750 -o node -g node /workspace && \
+-    install -d -m 0700 -o caddy -g caddy /data/caddy /data/caddy/config
++    install -d -m 0750 -o node -g node /workspace
+ 
+ RUN npm install --global "pnpm@${PNPM_VERSION}" && \
+     npm cache clean --force && \
+     test "$(gosu node env HOME=/data/dsh/home pnpm --version)" = "$PNPM_VERSION"
+ 
+-COPY deepseek-harness/Caddyfile /etc/caddy/Caddyfile
++COPY deepseek-harness/node-proxy.mjs /usr/local/bin/dsh-node-proxy
+ COPY deepseek-harness/dsh /usr/local/bin/dsh
+ COPY deepseek-harness/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+ COPY deepseek-harness/test-runtime.mjs /tmp/test-dsh-runtime.mjs
+ 
+-RUN chmod 0755 /usr/local/bin/dsh /usr/local/bin/docker-entrypoint.sh && \
++RUN chmod 0755 /usr/local/bin/dsh /usr/local/bin/docker-entrypoint.sh \
++      /usr/local/bin/dsh-node-proxy && \
+     dsh --help >/dev/null && \
+     /usr/local/bin/docker-entrypoint.sh --self-test && \
++    /usr/local/bin/dsh-node-proxy --self-test && \
+     node --test /tmp/test-dsh-runtime.mjs && \
+     rm /tmp/test-dsh-runtime.mjs
+ 
+@@ -72,10 +70,12 @@ ENV DSH_HOME=/data/dsh \
+ 
+ WORKDIR /workspace
+ 
+-EXPOSE 8443
++EXPOSE 8080
+ 
+-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+-  CMD curl -fsS --max-time 5 http://127.0.0.1:3080/ >/dev/null || exit 1
++# The entrypoint waits up to 60 s for the backend before starting the proxy, so the
++# start period must stay above that or a cold container is briefly marked unhealthy.
++HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 \
++  CMD curl -fsS --noproxy '*' --max-time 5 http://127.0.0.1:8080/healthz >/dev/null || exit 1
+ 
+ STOPSIGNAL SIGTERM
+ 
+diff --git a/deepseek-harness/docker-entrypoint.sh b/deepseek-harness/docker-entrypoint.sh
+index c7a263e..aece32b 100644
+--- a/deepseek-harness/docker-entrypoint.sh
++++ b/deepseek-harness/docker-entrypoint.sh
+@@ -5,6 +5,9 @@ is_access_host() {
+   node -e '
+     const { isIPv4 } = require("node:net");
+     const value = process.argv[1];
++    // Wildcard and broadcast literals are never a browser authority; accepting
++    // them would only produce a white screen (and would trust a loopback alias).
++    if (value === "0.0.0.0" || value === "255.255.255.255") process.exit(1);
+     const hostname = value.length <= 253 && !/^[0-9.]+$/.test(value) &&
+       value.split(".").every((label) => /^(?!-)[A-Za-z0-9-]{1,63}(?<!-)$/.test(label));
+     process.exit(isIPv4(value) || hostname ? 0 : 1);
+@@ -17,6 +20,8 @@ if [[ "${1:-}" == "--self-test" ]]; then
+   ! is_access_host https://dsh.example.com
+   ! is_access_host 203.0.113.10:10443
+   ! is_access_host 203.0.113.999
++  ! is_access_host 0.0.0.0
++  ! is_access_host 255.255.255.255
+   exit 0
+ fi
+ 
+@@ -24,31 +29,28 @@ printf '\033[1;32m%s\033[0m\n' 'This image is maintained by 1Panel.'
+ printf '\033[1;33m%s\033[0m\n' 'For support or issue discussion, please visit:'
+ printf '\033[1;36m%s\033[0m\n' 'https://github.com/1Panel-dev/1Panel/discussions'
+ 
+-access_host="${HTTPS_ACCESS_HOST:-}"
+-auth_username="${DSH_AUTH_USERNAME:-}"
+-auth_password="${DSH_AUTH_PASSWORD:-}"
++# DSH_ACCESS_HOST is the host name browsers use to reach the deployment. It is
++# only used to fence the backend's /api requests; this container terminates no
++# TLS. HTTPS_ACCESS_HOST is accepted for compatibility with older deployments.
++access_host="${DSH_ACCESS_HOST:-${HTTPS_ACCESS_HOST:-}}"
+ 
+-if ! is_access_host "$access_host"; then
+-  printf 'HTTPS_ACCESS_HOST must be an IPv4 address or hostname without a scheme, path, or port.\n' >&2
+-  exit 1
++if [[ -z "${DSH_ACCESS_HOST:-}" && -n "${HTTPS_ACCESS_HOST:-}" ]]; then
++  printf 'HTTPS_ACCESS_HOST is deprecated; rename it to DSH_ACCESS_HOST (this container serves plain HTTP).\n' >&2
+ fi
+ 
+-if [[ ! "$auth_username" =~ ^[A-Za-z0-9._-]+$ ]]; then
+-  printf 'DSH_AUTH_USERNAME must contain only letters, numbers, dot, underscore, or hyphen.\n' >&2
++if ! is_access_host "$access_host"; then
++  printf 'DSH_ACCESS_HOST must be an IPv4 address or hostname without a scheme, path, or port (wildcard/broadcast addresses are rejected).\n' >&2
+   exit 1
+ fi
+ 
+-if (( ${#auth_password} < 12 )); then
+-  printf 'DSH_AUTH_PASSWORD must contain at least 12 characters.\n' >&2
+-  exit 1
++if [[ "$access_host" == 127.* ]]; then
++  printf 'Warning: DSH_ACCESS_HOST is a loopback address; the backend also trusts loopback Hosts, so the proxy Host allowlist adds nothing. Use the browser-facing host name.\n' >&2
+ fi
+ 
+-password_hash="$(caddy hash-password --algorithm argon2id --plaintext "$auth_password")"
+-unset HTTPS_ACCESS_HOST DSH_AUTH_USERNAME DSH_AUTH_PASSWORD auth_password
++unset DSH_ACCESS_HOST HTTPS_ACCESS_HOST
+ 
+ install -d -m 0700 -o node -g node /data/dsh /data/dsh/home
+ install -d -m 0750 -o node -g node /workspace
+-install -d -m 0700 -o caddy -g caddy /data/caddy /data/caddy/config
+ 
+ pids=()
+ cleanup() {
+@@ -74,7 +76,7 @@ pids+=("$dsh_pid")
+ 
+ ready=false
+ for _ in {1..60}; do
+-  if curl -fsS --max-time 2 http://127.0.0.1:3080/ >/dev/null 2>&1; then
++  if curl -fsS --noproxy '*' --max-time 2 http://127.0.0.1:3080/ >/dev/null 2>&1; then
+     ready=true
+     break
+   fi
+@@ -90,19 +92,18 @@ if [[ "$ready" != true ]]; then
+   exit 1
+ fi
+ 
+-gosu caddy env \
+-  XDG_DATA_HOME=/data/caddy \
+-  XDG_CONFIG_HOME=/data/caddy/config \
+-  CADDY_ACCESS_HOST="$access_host" \
+-  DSH_AUTH_USERNAME="$auth_username" \
+-  DSH_AUTH_PASSWORD_HASH="$password_hash" \
+-  caddy run --config /etc/caddy/Caddyfile --adapter caddyfile &
+-caddy_pid=$!
+-pids+=("$caddy_pid")
++gosu node env \
++  HOME=/data/dsh/home \
++  PROXY_LISTEN_HOST=0.0.0.0 \
++  PROXY_LISTEN_PORT=8080 \
++  PROXY_ALLOWED_HOSTS="$access_host" \
++  node /usr/local/bin/dsh-node-proxy &
++proxy_pid=$!
++pids+=("$proxy_pid")
+ 
+-printf 'DeepSeek Harness is available at https://%s:8443 inside the container.\n' "$access_host"
+-printf 'The local CA certificate is stored at /data/caddy/pki/authorities/local/root.crt.\n'
++printf 'DeepSeek Harness is available at http://%s:8080 inside the container (plain HTTP).\n' "$access_host"
++printf 'This container performs no TLS and no authentication: restrict port 8080 to the trusted reverse proxy.\n'
+ 
+ status=0
+-wait -n "$dsh_pid" "$caddy_pid" || status=$?
++wait -n "$dsh_pid" "$proxy_pid" || status=$?
+ exit "$status"
+diff --git a/deepseek-harness/node-proxy.mjs b/deepseek-harness/node-proxy.mjs
+new file mode 100644
+index 0000000..4b9986c
+--- /dev/null
++++ b/deepseek-harness/node-proxy.mjs
+@@ -0,0 +1,486 @@
++#!/usr/bin/env node
++// Plain-HTTP forwarding proxy for DeepSeek Harness.
++//
++// Replaces Caddy in deployments where an upstream reverse proxy already provides
++// authentication and TLS: this process terminates nothing, authenticates nobody,
++// and only forwards HTTP + WebSocket traffic to the loopback DSH backend.
++//
++// Security model: the listener MUST NOT be reachable by anything except the
++// trusted upstream proxy. It enforces a Host allowlist and can require a shared
++// secret header, but those are not authentication — they only stop an accidental
++// or network-adjacent client from using this port.
++import http from 'node:http'
++import net from 'node:net'
++import crypto from 'node:crypto'
++
++// A closed stdout (log pipe) must never take the whole proxy — and with it every
++// running agent session — down with an unhandled EPIPE.
++process.stdout.on('error', () => {})
++
++const HOP_BY_HOP = new Set([
++  'connection',
++  'keep-alive',
++  'proxy-authenticate',
++  'proxy-authorization',
++  'proxy-connection',
++  'te',
++  'trailer',
++  'transfer-encoding',
++  'upgrade',
++])
++// Credentials the proxy owns, plus forwarding metadata a client must not forge:
++// DSH does not read any of these, and trusting them would only widen the spoof surface.
++const STRIPPED_REQUEST_HEADERS = new Set([
++  'authorization',
++  'proxy-authorization',
++  'x-dsh-proxy-secret',
++  'forwarded',
++  'x-forwarded-for',
++  'x-forwarded-host',
++  'x-forwarded-proto',
++  'x-forwarded-port',
++  'x-real-ip',
++])
++const STRIPPED_RESPONSE_HEADERS = new Set(['server', 'x-powered-by'])
++
++function envInt(name, fallback) {
++  const raw = process.env[name]
++  if (raw === undefined || raw === '') return fallback
++  const value = Number(raw)
++  if (!Number.isInteger(value) || value < 0 || value > 65535) {
++    fail(`${name} must be an integer between 0 and 65535`)
++  }
++  return value
++}
++
++function fail(message) {
++  process.stderr.write(`dsh-node-proxy: ${message}\n`)
++  process.exit(1)
++}
++
++/** Canonical host form: lowercase, no trailing dot, no port. */
++export function normalizeHost(authority) {
++  let value = String(authority ?? '').trim().toLowerCase()
++  if (value === '') return ''
++  if (value.startsWith('[')) {
++    const end = value.indexOf(']')
++    return end === -1 ? '' : value.slice(1, end)
++  }
++  const colon = value.lastIndexOf(':')
++  if (colon !== -1 && /^\d+$/.test(value.slice(colon + 1))) value = value.slice(0, colon)
++  return value.endsWith('.') ? value.slice(0, -1) : value
++}
++
++const accessHosts = (process.env.PROXY_ALLOWED_HOSTS ?? '')
++  .split(',')
++  .map(normalizeHost)
++  .filter(Boolean)
++const listenHost = process.env.PROXY_LISTEN_HOST ?? '0.0.0.0'
++const listenPort = envInt('PROXY_LISTEN_PORT', 8080)
++const backendHost = process.env.PROXY_BACKEND_HOST ?? '127.0.0.1'
++const backendPort = envInt('PROXY_BACKEND_PORT', 3080)
++const sharedSecret = process.env.PROXY_SHARED_SECRET ?? ''
++const accessLog = process.env.PROXY_ACCESS_LOG !== '0'
++const upstreamHeaderTimeoutMs = 120_000
++
++/** @returns {boolean} whether the request authority is one we serve. */
++function hostAllowed(authority) {
++  return accessHosts.includes(normalizeHost(authority))
++}
++
++/** @returns {boolean} whether the presented Host ends with a dot (rejected: DSH 403s it). */
++function hostHasTrailingDot(authority) {
++  const value = String(authority ?? '').trim()
++  if (value.startsWith('[')) return false
++  const withoutPort = value.replace(/:\d+$/, '')
++  return withoutPort.endsWith('.')
++}
++
++/** @returns {boolean} whether more than one Host header was sent (RFC 7230 requires 400). */
++function duplicateHost(request) {
++  let seen = 0
++  for (let index = 0; index < request.rawHeaders.length; index += 2) {
++    if (request.rawHeaders[index].toLowerCase() === 'host') seen += 1
++  }
++  return seen > 1
++}
++
++function isLoopback(remote) {
++  return remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1'
++}
++
++/** Constant-time shared-secret check; an empty secret disables the requirement. */
++function secretOk(request) {
++  if (sharedSecret === '') return true
++  const presented = request.headers['x-dsh-proxy-secret']
++  if (typeof presented !== 'string') return false
++  const expected = Buffer.from(sharedSecret)
++  const actual = Buffer.from(presented)
++  return expected.length === actual.length && crypto.timingSafeEqual(expected, actual)
++}
++
++/** Header names named by the Connection header are hop-by-hop too (RFC 7230 §6.1). */
++function connectionTokens(value) {
++  const tokens = []
++  for (const part of String(value ?? '').split(',')) {
++    const token = part.trim().toLowerCase()
++    if (token !== '') tokens.push(token)
++  }
++  return tokens
++}
++
++/** Copy end-to-end request headers, keeping the original Host verbatim. */
++function requestHeaders(request) {
++  const drop = new Set(HOP_BY_HOP)
++  for (const token of connectionTokens(request.headers.connection)) drop.add(token)
++  const headers = {}
++  for (const [name, value] of Object.entries(request.headers)) {
++    const lower = name.toLowerCase()
++    if (drop.has(lower) || STRIPPED_REQUEST_HEADERS.has(lower)) continue
++    headers[name] = value
++  }
++  return headers
++}
++
++/** Copy end-to-end response headers and force the security headers Caddy used to set. */
++function responseHeaders(upstream) {
++  const drop = new Set(HOP_BY_HOP)
++  for (const token of connectionTokens(upstream.headers.connection)) drop.add(token)
++  const headers = {}
++  for (const [name, value] of Object.entries(upstream.headers)) {
++    const lower = name.toLowerCase()
++    if (drop.has(lower) || STRIPPED_RESPONSE_HEADERS.has(lower)) continue
++    headers[name] = value
++  }
++  headers['x-content-type-options'] = 'nosniff'
++  headers['referrer-policy'] = 'same-origin'
++  return headers
++}
++
++function logLine(request, remote, status, startedAt, bytes) {
++  if (!accessLog) return
++  const path = (request.url ?? '/').split('?')[0]
++  process.stdout.write(`${JSON.stringify({
++    time: new Date().toISOString(),
++    remote,
++    method: request.method ?? '',
++    path,
++    status,
++    ms: Math.round(Number(process.hrtime.bigint() - startedAt) / 1e6),
++    bytes,
++  })}\n`)
++}
++
++function logUpgrade(request, remote, status, startedAt) {
++  if (!accessLog) return
++  process.stdout.write(`${JSON.stringify({
++    time: new Date().toISOString(),
++    remote,
++    method: request.method ?? '',
++    path: (request.url ?? '/').split('?')[0],
++    status,
++    ms: Math.round(Number(process.hrtime.bigint() - startedAt) / 1e6),
++    bytes: 0,
++    upgrade: true,
++  })}\n`)
++}
++
++// DSH's own HTTP server closes idle keep-alive sockets after ~5 s; keep the pool's
++// idle timeout below that so a reused socket is never one the backend already closed.
++const agent = new http.Agent({ keepAlive: true, keepAliveMsecs: 1000, maxSockets: 256, timeout: 4000 })
++const trackedSockets = new Set()
++
++function securityHeaders() {
++  return {
++    'content-type': 'application/json',
++    'x-content-type-options': 'nosniff',
++    'referrer-policy': 'same-origin',
++  }
++}
++
++/**
++ * Readiness/liveness: proves this proxy AND the DSH backend answer.
++ * Reachable only from loopback (the container healthcheck) or with the shared
++ * secret, so an unauthenticated client cannot use it to probe the backend.
++ */
++function healthz(request, remote, response, startedAt) {
++  response.on('finish', () => logLine(request, remote, response.statusCode, startedAt, 0))
++  if (!isLoopback(remote) && !secretOk(request)) {
++    response.writeHead(403, { ...securityHeaders(), 'content-type': 'text/plain' })
++    response.end('forbidden\n')
++    return
++  }
++
++  let settled = false
++  const finish = (status, payload) => {
++    if (settled) return
++    settled = true
++    if (response.writableEnded || response.destroyed) return
++    response.writeHead(status, securityHeaders())
++    response.end(`${JSON.stringify(payload)}\n`)
++  }
++
++  const probe = http.request(
++    {
++      host: backendHost,
++      port: backendPort,
++      method: 'GET',
++      path: '/',
++      headers: { host: `${backendHost}:${backendPort}`, connection: 'close' },
++      timeout: 2000,
++    },
++    (upstream) => {
++      upstream.resume()
++      const status = upstream.statusCode ?? 0
++      // A 401 means the auth bypass patch is missing; report it as unhealthy.
++      finish(status === 200 ? 200 : 502, { ok: status === 200, backend: status })
++    },
++  )
++  probe.on('timeout', () => probe.destroy(new Error('backend timeout')))
++  probe.on('error', () => {
++    probe.destroy()
++    finish(502, { ok: false })
++  })
++  response.on('close', () => {
++    if (!response.writableFinished) probe.destroy()
++  })
++  probe.end()
++}
++
++function reject(response, status, message) {
++  response.writeHead(status, {
++    'content-type': 'text/plain',
++    'x-content-type-options': 'nosniff',
++    'referrer-policy': 'same-origin',
++  })
++  response.end(`${message}\n`)
++}
++
++const server = http.createServer((request, response) => {
++  const startedAt = process.hrtime.bigint()
++  // Captured now: after a client abort the socket no longer reports an address.
++  const remote = request.socket.remoteAddress ?? ''
++  const path = (request.url ?? '/').split('?')[0]
++  if (path === '/healthz') {
++    healthz(request, remote, response, startedAt)
++    return
++  }
++  if (duplicateHost(request)) {
++    reject(response, 400, 'bad request: duplicate Host header')
++    logLine(request, remote, 400, startedAt, 0)
++    return
++  }
++  if (request.headers.host === undefined) {
++    reject(response, 400, 'bad request: missing Host')
++    logLine(request, remote, 400, startedAt, 0)
++    return
++  }
++  if (hostHasTrailingDot(request.headers.host)) {
++    // The backend's own Host fence rejects FQDN trailing dots with 403; say so clearly.
++    reject(response, 400, 'bad request: Host must not end with a dot')
++    logLine(request, remote, 400, startedAt, 0)
++    return
++  }
++  if (!hostAllowed(request.headers.host)) {
++    reject(response, 403, 'forbidden')
++    logLine(request, remote, 403, startedAt, 0)
++    return
++  }
++  if (!secretOk(request)) {
++    reject(response, 403, 'forbidden')
++    logLine(request, remote, 403, startedAt, 0)
++    return
++  }
++
++  // Exactly one access-log line per request, and a distinct status when the
++  // client itself walked away mid-stream (nginx calls this 499).
++  let logged = false
++  let clientGone = false
++  const log = (status, bytes) => {
++    if (logged) return
++    logged = true
++    logLine(request, remote, status, startedAt, bytes)
++  }
++
++  let headerTimer
++  const upstream = http.request(
++    {
++      host: backendHost,
++      port: backendPort,
++      method: request.method,
++      path: request.url,
++      headers: requestHeaders(request),
++      agent,
++    },
++    (upstreamResponse) => {
++      clearTimeout(headerTimer)
++      const headers = responseHeaders(upstreamResponse)
++      response.writeHead(upstreamResponse.statusCode ?? 502, headers)
++      let bytes = 0
++      upstreamResponse.on('data', (chunk) => { bytes += chunk.length })
++      upstreamResponse.on('end', () => log(upstreamResponse.statusCode ?? 0, bytes))
++      // A mid-stream upstream failure must not crash the process or hang the client.
++      upstreamResponse.on('error', () => {
++        response.destroy()
++        log(clientGone ? 499 : 502, bytes)
++      })
++      // Stream chunk by chunk: LLM output and SSE must not be buffered.
++      upstreamResponse.pipe(response)
++    },
++  )
++  // A backend that accepts the connection but never answers must not pin the client forever.
++  headerTimer = setTimeout(() => upstream.destroy(new Error('upstream response timeout')), upstreamHeaderTimeoutMs)
++  upstream.on('response', () => clearTimeout(headerTimer))
++  upstream.on('close', () => clearTimeout(headerTimer))
++  upstream.on('error', (error) => {
++    clearTimeout(headerTimer)
++    const timedOut = error.message === 'upstream response timeout'
++    // Keep the detail in the container log; the client only sees a generic status.
++    if (!clientGone) process.stderr.write(`dsh-node-proxy: upstream error: ${error.message}\n`)
++    if (!response.headersSent) {
++      reject(response, timedOut ? 504 : 502, timedOut ? 'gateway timeout' : 'bad gateway')
++      log(timedOut ? 504 : 502, 0)
++    } else {
++      response.destroy()
++      log(clientGone ? 499 : timedOut ? 504 : 502, 0)
++    }
++  })
++  // Client aborted mid-request (including mid-upload): stop the upstream.
++  request.on('aborted', () => {
++    clientGone = true
++    upstream.destroy()
++  })
++  request.on('error', () => {
++    clientGone = true
++    upstream.destroy()
++  })
++  request.on('close', () => {
++    if (!request.complete) {
++      clientGone = true
++      upstream.destroy()
++    }
++  })
++  response.on('close', () => {
++    if (!response.writableFinished) {
++      clientGone = true
++      upstream.destroy()
++    }
++  })
++  request.pipe(upstream)
++})
++
++server.on('upgrade', (request, socket, head) => {
++  const startedAt = process.hrtime.bigint()
++  const remote = request.socket.remoteAddress ?? ''
++  trackedSockets.add(socket)
++  socket.on('close', () => trackedSockets.delete(socket))
++  socket.on('error', () => socket.destroy())
++
++  const refuse = (status) => {
++    logUpgrade(request, remote, status, startedAt)
++    socket.end(`HTTP/1.1 ${status} Forbidden\r\nConnection: close\r\nContent-Length: 9\r\n\r\nforbidden`)
++  }
++
++  if (duplicateHost(request) || hostHasTrailingDot(request.headers.host ?? '') ||
++      request.headers.host === undefined || !hostAllowed(request.headers.host) || !secretOk(request)) {
++    refuse(403)
++    return
++  }
++
++  const drop = new Set(STRIPPED_REQUEST_HEADERS)
++  const lines = [`${request.method} ${request.url} HTTP/1.1`]
++  for (let index = 0; index < request.rawHeaders.length; index += 2) {
++    const name = request.rawHeaders[index]
++    if (drop.has(name.toLowerCase())) continue
++    lines.push(`${name}: ${request.rawHeaders[index + 1]}`)
++  }
++  const upstream = net.connect(backendPort, backendHost, () => {
++    upstream.write(`${lines.join('\r\n')}\r\n\r\n`)
++    if (head?.length) upstream.write(head)
++  })
++  // Log the status the backend actually answered with (101 for a successful upgrade).
++  let logged = false
++  let preface = ''
++  upstream.on('data', (chunk) => {
++    if (!logged) {
++      preface += chunk.toString('latin1')
++      const match = /^HTTP\/1\.[01] (\d{3})/.exec(preface)
++      if (match) {
++        logged = true
++        logUpgrade(request, remote, Number(match[1]), startedAt)
++      }
++    }
++    if (!socket.write(chunk)) upstream.pause()
++  })
++  socket.on('drain', () => upstream.resume())
++  socket.on('data', (chunk) => {
++    if (!upstream.write(chunk)) socket.pause()
++  })
++  upstream.on('drain', () => socket.resume())
++  upstream.on('error', () => socket.destroy())
++  upstream.on('close', () => {
++    if (!logged) logUpgrade(request, remote, 0, startedAt)
++    socket.destroy()
++  })
++  socket.on('error', () => upstream.destroy())
++  socket.on('close', () => {
++    if (!logged) logUpgrade(request, remote, 0, startedAt)
++    upstream.destroy()
++  })
++  socket.setTimeout(0)
++  upstream.setTimeout(0)
++})
++
++server.on('clientError', (error, socket) => {
++  if (socket.writable && error.code !== 'ECONNRESET') {
++    socket.end(
++      'HTTP/1.1 400 Bad Request\r\nConnection: close\r\n' +
++      'Content-Type: text/plain\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: same-origin\r\n\r\n',
++    )
++  } else {
++    socket.destroy()
++  }
++})
++
++// Long uploads and long-lived streams need generous limits; DSH owns the
++// application-level 300 MiB body cap and replies 413 itself. A stalled backend is
++// bounded by upstreamHeaderTimeoutMs instead of by the client connection.
++server.requestTimeout = 0
++server.headersTimeout = 60_000
++server.keepAliveTimeout = 65_000
++
++let shuttingDown = false
++function shutdown(signal) {
++  if (shuttingDown) return
++  shuttingDown = true
++  process.stdout.write(`dsh-node-proxy: ${signal} received, draining\n`)
++  server.close(() => process.exit(0))
++  for (const socket of trackedSockets) socket.destroy()
++  server.closeIdleConnections?.()
++  setTimeout(() => process.exit(0), 5000).unref()
++}
++for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => shutdown(signal))
++
++if (process.argv.includes('--self-test')) {
++  const ok = normalizeHost('DSH.Example.COM.:8080') === 'dsh.example.com' &&
++    normalizeHost('203.0.113.10:8080') === '203.0.113.10' &&
++    normalizeHost('') === '' &&
++    normalizeHost('[::1]:8080') === '::1' &&
++    hostHasTrailingDot('dsh.example.com.') === true &&
++    hostHasTrailingDot('dsh.example.com:8080') === false
++  process.exit(ok ? 0 : 1)
++}
++
++if (accessHosts.length === 0) {
++  fail('PROXY_ALLOWED_HOSTS is required (comma-separated host names, e.g. dsh.example.com)')
++}
++
++server.listen(listenPort, listenHost, () => {
++  const address = server.address()
++  const port = typeof address === 'object' && address !== null ? address.port : listenPort
++  process.stdout.write(
++    `dsh-node-proxy listening on ${listenHost}:${port} -> ${backendHost}:${backendPort} ` +
++    `(plain HTTP, no authentication; allowed hosts: ${accessHosts.join(', ')}` +
++    `${sharedSecret === '' ? '' : '; shared secret required'})\n`,
++  )
++})
+diff --git a/deepseek-harness/patch-dsh-authenticated-settings.mjs b/deepseek-harness/patch-dsh-authenticated-settings.mjs
+index 518f879..2ec6115 100644
+--- a/deepseek-harness/patch-dsh-authenticated-settings.mjs
++++ b/deepseek-harness/patch-dsh-authenticated-settings.mjs
+@@ -23,7 +23,8 @@ function replaceOnce(source, original, replacement, label) {
+ }
+ 
+ // DSH 0.2.1 persists settings through remote.settings for authenticated clients.
+-// Only adapt browser authentication for the loopback backend protected by Caddy.
++// Only adapt browser authentication for the loopback backend protected by the
++// container's plain-HTTP forwarding proxy.
+ const connectionPath = join(
+   await packageRoot('@deepseek-ai/dsh-client-connection'),
+   'lib/index.js',
+diff --git a/deepseek-harness/test-runtime.mjs b/deepseek-harness/test-runtime.mjs
+index 143af1d..2880d83 100644
+--- a/deepseek-harness/test-runtime.mjs
++++ b/deepseek-harness/test-runtime.mjs
+@@ -1,11 +1,10 @@
+ import assert from 'node:assert/strict'
+-import { spawn, spawnSync } from 'node:child_process'
++import { spawn } from 'node:child_process'
+ import { once } from 'node:events'
+-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
++import { readFile } from 'node:fs/promises'
+ import http from 'node:http'
+-import https from 'node:https'
++import net from 'node:net'
+ import { createRequire } from 'node:module'
+-import { tmpdir } from 'node:os'
+ import { join } from 'node:path'
+ import test from 'node:test'
+ import vm from 'node:vm'
+@@ -51,80 +50,473 @@ test('embedded PDF worker initializes its own Iterator helpers', async t => {
+   assert.equal(result.ok, true)
+ })
+ 
+-test('Caddy forwards valid settings requests and rejects cross-site API requests', { timeout: 60000 }, async t => {
+-  const caddy = process.env.CADDY_BINARY ?? 'caddy'
+-  const directory = await mkdtemp(join(tmpdir(), 'dsh-proxy-test-'))
+-  t.after(() => rm(directory, { recursive: true, force: true }))
+-  let forwarded = 0
+-  const backend = http.createServer(async (request, response) => {
+-    forwarded++
++// ---------------------------------------------------------------------------
++// Node forwarding proxy: it must behave like the Caddy route it replaced for
++// everything DSH itself does not enforce (Host preservation, streaming, WS).
++// ---------------------------------------------------------------------------
++
++const proxyBin = process.env.DSH_PROXY_BIN ?? '/usr/local/bin/dsh-node-proxy'
++const ALLOWED_HOST = 'dsh.example.com'
++
++/** Reserve a free TCP port on loopback. */
++async function freePort() {
++  const server = net.createServer()
++  server.listen(0, '127.0.0.1')
++  await once(server, 'listening')
++  const { port } = server.address()
++  await new Promise((resolve) => server.close(resolve))
++  return port
++}
++
++/** Start a mock DSH backend and record the requests it receives. */
++async function startBackend(handler) {
++  const requests = []
++  const upgraded = new Set()
++  const server = http.createServer((request, response) => {
+     let body = ''
+-    for await (const chunk of request) body += chunk
+-    response.setHeader('Content-Type', 'application/json')
+-    response.end(JSON.stringify({ ok: true, headers: request.headers, body: body ? JSON.parse(body) : null }))
+-  })
+-  backend.listen(0, '127.0.0.1')
+-  await once(backend, 'listening')
+-  t.after(() => new Promise(resolve => backend.close(resolve)))
+-  const backendPort = backend.address().port
+-  const reserve = http.createServer()
+-  reserve.listen(0, '127.0.0.1')
+-  await once(reserve, 'listening')
+-  const port = reserve.address().port
+-  await new Promise(resolve => reserve.close(resolve))
+-  const password = 'dsh-test-password'
+-  const hash = spawnSync(caddy, ['hash-password', '--algorithm', 'argon2id', '--plaintext', password], { encoding: 'utf8' })
+-  assert.equal(hash.status, 0, hash.error?.message ?? hash.stderr)
+-  const config = (await readFile(process.env.DSH_CADDYFILE ?? '/etc/caddy/Caddyfile', 'utf8'))
+-    .replaceAll(':8443', `:${port}`).replaceAll('127.0.0.1:3080', `127.0.0.1:${backendPort}`)
+-  const configPath = join(directory, 'Caddyfile')
+-  await writeFile(configPath, config)
+-  const processCaddy = spawn(caddy, ['run', '--config', configPath, '--adapter', 'caddyfile'], {
+-    env: { ...process.env, CADDY_ACCESS_HOST: '127.0.0.1', DSH_AUTH_USERNAME: 'test', DSH_AUTH_PASSWORD_HASH: hash.stdout.trim(), XDG_DATA_HOME: directory, XDG_CONFIG_HOME: directory },
+-    stdio: ['ignore', 'ignore', 'pipe'],
+-  })
+-  let logs = ''
+-  processCaddy.stderr.on('data', chunk => { logs += chunk })
+-  const exited = once(processCaddy, 'exit')
+-  t.after(async () => { processCaddy.kill('SIGTERM'); await exited })
+-  const origin = `https://127.0.0.1:${port}`
+-  const request = (pathname, headers = {}, authenticated = true) => new Promise((resolve, reject) => {
+-    const req = https.request(`${origin}${pathname}`, {
+-      method: 'POST', rejectUnauthorized: false, servername: '',
+-      headers: { 'Content-Type': 'application/json', Origin: origin, ...(authenticated ? { Authorization: `Basic ${Buffer.from(`test:${password}`).toString('base64')}` } : {}), ...headers },
+-    }, response => {
+-      let body = ''
+-      response.on('data', chunk => { body += chunk })
+-      response.on('end', () => resolve({ status: response.statusCode, body }))
++    request.on('data', (chunk) => { body += chunk })
++    request.on('end', () => {
++      requests.push({ method: request.method, url: request.url, headers: request.headers, body })
++      handler(request, response, { body, requests })
+     })
+-    req.setTimeout(3000, () => req.destroy(new Error('proxy request timed out')))
+-    req.on('error', reject)
+-    req.end(JSON.stringify({ value: 'test' }))
+   })
+-  for (let attempt = 0; ; attempt++) {
+-    try { await request('/'); break } catch (error) {
+-      if (attempt === 100 || processCaddy.exitCode !== null) throw new Error(logs, { cause: error })
+-      await new Promise(resolve => setTimeout(resolve, 100))
+-    }
++  server.on('upgrade', (request, socket) => {
++    upgraded.add(socket)
++    socket.on('close', () => upgraded.delete(socket))
++    requests.push({ method: request.method, url: request.url, headers: request.headers, upgrade: true })
++    const key = request.headers['sec-websocket-key'] ?? ''
++    socket.write(
++      'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
++      `Sec-WebSocket-Accept: ${key}\r\n\r\n`,
++    )
++    socket.on('data', (chunk) => socket.write(chunk))
++  })
++  server.listen(0, '127.0.0.1')
++  await once(server, 'listening')
++  const { port } = server.address()
++  return {
++    port,
++    requests,
++    close: () => new Promise((resolve) => {
++      // Upgraded sockets are not covered by closeAllConnections(), so close()
++      // would otherwise wait forever on an open WebSocket.
++      for (const socket of upgraded) socket.destroy()
++      server.closeAllConnections?.()
++      server.close(resolve)
++    }),
++  }
++}
++
++/** Start the proxy against a backend port and wait until it listens. */
++async function startProxy(backendPort, env = {}) {
++  const child = spawn(process.execPath, [proxyBin], {
++    env: {
++      ...process.env,
++      PROXY_LISTEN_HOST: '127.0.0.1',
++      // Port 0 lets the kernel pick: no reserve/release race between tests.
++      PROXY_LISTEN_PORT: '0',
++      PROXY_BACKEND_HOST: '127.0.0.1',
++      PROXY_BACKEND_PORT: String(backendPort),
++      PROXY_ALLOWED_HOSTS: ALLOWED_HOST,
++      PROXY_ACCESS_LOG: '0',
++      // Never inherit a developer's shared secret; tests opt in explicitly.
++      PROXY_SHARED_SECRET: '',
++      ...env,
++    },
++    stdio: ['ignore', 'pipe', 'pipe'],
++  })
++  let output = ''
++  child.stdout.on('data', (chunk) => { output += chunk })
++  child.stderr.on('data', (chunk) => { output += chunk })
++  for (let attempt = 0; attempt < 100; attempt++) {
++    if (output.includes('listening on')) break
++    if (child.exitCode !== null) throw new Error(`proxy exited: ${output}`)
++    await new Promise((resolve) => setTimeout(resolve, 50))
+   }
+-  for (const endpoint of ['settings/describe', 'settings/update', 'settings/replace', 'settings/mutate', 'credentials/describe', 'credentials/set', 'credentials/unset', 'llm/discoverModels']) {
+-    const response = await request(`/api/${endpoint}`)
+-    assert.equal(response.status, 200, endpoint)
+-    const data = JSON.parse(response.body)
+-    assert.equal(data.ok, true)
+-    assert.equal(data.headers.host, `127.0.0.1:${backendPort}`)
+-    assert.equal(data.headers.origin, undefined)
+-    assert.equal(data.headers.authorization, undefined)
+-    assert.equal(data.body.value, 'test')
++  assert.ok(output.includes('listening on'), `proxy did not start: ${output}`)
++  const match = /listening on [^\s]+:(\d+)/.exec(output)
++  assert.ok(match, `proxy did not report its port: ${output}`)
++  const port = Number(match[1])
++  return {
++    port,
++    child,
++    stop: async () => {
++      if (child.exitCode !== null) return
++      const exited = once(child, 'exit')
++      child.kill('SIGTERM')
++      await exited
++    },
+   }
+-  const beforeRejected = forwarded
+-  for (const pathname of ['/api', '/api/settings/update', '/api/credentials/set', '/api/remote.mux']) {
+-    for (const headers of [{ Origin: 'https://attacker.invalid' }, { Origin: 'null' }, { Origin: `http://127.0.0.1:${port}` }, { Origin: 'https://127.0.0.1:1' }, { 'Sec-Fetch-Site': 'cross-site' }, { Origin: '', 'Sec-Fetch-Site': 'cross-site' }]) {
+-      assert.equal((await request(pathname, headers)).status, 403)
+-    }
++}
++
++/** One HTTP request against the proxy; resolves with status, headers and body. */
++function request(port, { method = 'GET', path = '/', headers = {}, body } = {}) {
++  return new Promise((resolve, reject) => {
++    const req = http.request(
++      { host: '127.0.0.1', port, method, path, headers: { Host: ALLOWED_HOST, ...headers }, agent: false },
++      (response) => {
++        let received = ''
++        response.on('data', (chunk) => { received += chunk })
++        response.on('end', () => resolve({ status: response.statusCode, headers: response.headers, body: received }))
++      },
++    )
++    req.setTimeout(10000, () => req.destroy(new Error('proxy request timed out')))
++    req.on('error', reject)
++    req.end(body)
++  })
++}
++
++test('proxy preserves Host and Origin, strips credentials, adds security headers', { timeout: 30000 }, async (t) => {
++  const backend = await startBackend((_request, response, { body }) => {
++    response.writeHead(200, { 'content-type': 'application/json' })
++    response.end(JSON.stringify({ ok: true, body }))
++  })
++  const proxy = await startProxy(backend.port)
++  t.after(async () => { await proxy.stop(); await backend.close() })
++
++  const response = await request(proxy.port, {
++    method: 'POST',
++    path: '/api/settings/describe',
++    headers: {
++      Origin: `http://${ALLOWED_HOST}`,
++      'Content-Type': 'application/json',
++      Authorization: 'Basic dGVzdDp0ZXN0',
++      'X-DSH-Proxy-Secret': 'leaked-secret',
++    },
++    body: JSON.stringify({ type: 'client-request', rpcId: '1', method: 'settings/describe', payload: { args: {} } }),
++  })
++
++  assert.equal(response.status, 200)
++  assert.equal(response.headers['x-content-type-options'], 'nosniff')
++  assert.equal(response.headers['referrer-policy'], 'same-origin')
++  assert.equal(response.headers.server, undefined)
++
++  const [seen] = backend.requests
++  assert.equal(seen.headers.host, ALLOWED_HOST, 'Host must reach the backend verbatim')
++  assert.equal(seen.headers.origin, `http://${ALLOWED_HOST}`, 'Origin must survive for the CSRF fence')
++  assert.equal(seen.headers.authorization, undefined, 'Authorization must not reach the backend')
++  assert.equal(seen.headers['x-dsh-proxy-secret'], undefined, 'the proxy secret must not reach the backend')
++  assert.equal(seen.url, '/api/settings/describe')
++  assert.equal(JSON.parse(seen.body).method, 'settings/describe')
++})
++
++test('proxy rejects an unknown Host before the request reaches the backend', { timeout: 30000 }, async (t) => {
++  const backend = await startBackend((_request, response) => {
++    response.writeHead(200)
++    response.end('backend')
++  })
++  const proxy = await startProxy(backend.port)
++  t.after(async () => { await proxy.stop(); await backend.close() })
++
++  const rejected = await request(proxy.port, { path: '/api/settings/describe', headers: { Host: 'attacker.invalid' } })
++  assert.equal(rejected.status, 403)
++  assert.equal(rejected.body.trim(), 'forbidden')
++  assert.equal(backend.requests.length, 0, 'rejected requests must not be forwarded')
++
++  // HTTP/1.0 without a Host header is rejected explicitly rather than guessed.
++  const raw = await new Promise((resolve) => {
++    const socket = net.connect(proxy.port, '127.0.0.1', () => {
++      socket.write('GET / HTTP/1.0\r\n\r\n')
++    })
++    let received = ''
++    socket.on('data', (chunk) => { received += chunk })
++    socket.on('close', () => resolve(received))
++    socket.on('error', () => resolve(received))
++    setTimeout(() => socket.destroy(), 3000)
++  })
++  assert.match(raw, /^HTTP\/1\.[01] 400/)
++})
++
++test('proxy streams responses without buffering', { timeout: 30000 }, async (t) => {
++  const backend = await startBackend((_request, response) => {
++    response.writeHead(200, { 'content-type': 'text/plain' })
++    response.write('first\n')
++    // Generous gap: a buffering proxy would hold "first" this long.
++    setTimeout(() => response.end('second\n'), 800)
++  })
++  const proxy = await startProxy(backend.port)
++  t.after(async () => { await proxy.stop(); await backend.close() })
++
++  const startedAt = Date.now()
++  let firstChunkAt = 0
++  const body = await new Promise((resolve, reject) => {
++    const req = http.request(
++      { host: '127.0.0.1', port: proxy.port, path: '/', headers: { Host: ALLOWED_HOST }, agent: false },
++      (response) => {
++        let received = ''
++        response.on('data', (chunk) => {
++          if (firstChunkAt === 0) firstChunkAt = Date.now()
++          received += chunk
++        })
++        response.on('end', () => resolve(received))
++      },
++    )
++    req.setTimeout(10000, () => req.destroy(new Error('stream timed out')))
++    req.on('error', reject)
++    req.end()
++  })
++
++  assert.equal(body, 'first\nsecond\n')
++  // A buffering proxy would hold "first" until the backend ended 800 ms later.
++  assert.ok(firstChunkAt - startedAt < 600, `first chunk arrived after ${firstChunkAt - startedAt} ms`)
++})
++
++test('proxy forwards WebSocket upgrades and fences the Host', { timeout: 30000 }, async (t) => {
++  const backend = await startBackend((_request, response) => {
++    response.writeHead(200)
++    response.end('http')
++  })
++  const proxy = await startProxy(backend.port)
++  t.after(async () => { await proxy.stop(); await backend.close() })
++
++  const handshake = (host) => new Promise((resolve) => {
++    const socket = net.connect(proxy.port, '127.0.0.1', () => {
++      socket.write(
++        'GET /api/remote.mux HTTP/1.1\r\n' +
++        `Host: ${host}\r\n` +
++        'Origin: http://dsh.example.com\r\n' +
++        'Upgrade: websocket\r\nConnection: Upgrade\r\n' +
++        'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n',
++      )
++    })
++    let received = ''
++    socket.on('data', (chunk) => {
++      received += chunk
++      if (received.includes('\r\n\r\n')) {
++        socket.destroy()
++        resolve(received.split('\r\n')[0])
++      }
++    })
++    socket.on('error', () => resolve(received.split('\r\n')[0] ?? ''))
++    setTimeout(() => socket.destroy(), 3000)
++  })
++
++  assert.match(await handshake(ALLOWED_HOST), /^HTTP\/1\.1 101/)
++  assert.match(await handshake('attacker.invalid'), /^HTTP\/1\.1 403/)
++})
++
++test('proxy returns 502 when the backend is unreachable', { timeout: 30000 }, async (t) => {
++  const deadPort = await freePort()
++  const proxy = await startProxy(deadPort)
++  t.after(() => proxy.stop())
++
++  const response = await request(proxy.port, { path: '/' })
++  assert.equal(response.status, 502)
++  assert.match(response.body, /bad gateway/)
++})
++
++test('proxy enforces an optional shared secret', { timeout: 30000 }, async (t) => {
++  const backend = await startBackend((_request, response) => {
++    response.writeHead(200)
++    response.end('ok')
++  })
++  const proxy = await startProxy(backend.port, { PROXY_SHARED_SECRET: 's3cret-value' })
++  t.after(async () => { await proxy.stop(); await backend.close() })
++
++  assert.equal((await request(proxy.port, { path: '/' })).status, 403)
++  assert.equal((await request(proxy.port, { path: '/', headers: { 'X-DSH-Proxy-Secret': 'wrong' } })).status, 403)
++  const allowed = await request(proxy.port, { path: '/', headers: { 'X-DSH-Proxy-Secret': 's3cret-value' } })
++  assert.equal(allowed.status, 200)
++  assert.equal(allowed.body, 'ok')
++})
++
++test('healthz proves the backend answers and survives shutdown', { timeout: 30000 }, async (t) => {
++  const backend = await startBackend((_request, response) => {
++    response.writeHead(200)
++    response.end('ok')
++  })
++  const proxy = await startProxy(backend.port)
++  t.after(async () => { await backend.close() })
++
++  const healthy = await request(proxy.port, { path: '/healthz' })
++  assert.equal(healthy.status, 200)
++  assert.equal(JSON.parse(healthy.body).ok, true)
++
++  const exited = once(proxy.child, 'exit')
++  proxy.child.kill('SIGTERM')
++  const [code] = await exited
++  assert.equal(code, 0)
++})
++
++test('proxy normalizes Host case, trailing dot and port for the allowlist', { timeout: 30000 }, async (t) => {
++  const backend = await startBackend((_request, response) => {
++    response.writeHead(200)
++    response.end('ok')
++  })
++  const proxy = await startProxy(backend.port)
++  t.after(async () => { await proxy.stop(); await backend.close() })
++
++  for (const host of ['DSH.Example.COM', 'dsh.example.com:8443', 'Dsh.Example.COM:8080']) {
++    const response = await request(proxy.port, { path: '/', headers: { Host: host } })
++    assert.equal(response.status, 200, `Host ${host} should be accepted`)
+   }
+-  // Caddy can return an empty 200 for unmatched hosts; no request may reach DSH.
+-  assert.equal((await request('/api/settings/update', { Host: 'attacker.invalid', Origin: 'https://attacker.invalid' })).body, '')
+-  assert.equal((await request('/api/settings/describe', {}, false)).status, 401)
+-  assert.equal(forwarded, beforeRejected, 'rejected requests must never reach DSH')
++  assert.equal((await request(proxy.port, { path: '/', headers: { Host: 'dsh.example.com.evil.test' } })).status, 403)
++  // A FQDN trailing dot is a valid authority but DSH's fence 403s it; reject it here
++  // with a clear 400 instead of forwarding a confusing failure.
++  assert.equal((await request(proxy.port, { path: '/', headers: { Host: 'dsh.example.com.' } })).status, 400)
++})
++
++test('healthz reports the backend as unhealthy instead of pretending to be up', { timeout: 30000 }, async (t) => {
++  const deadPort = await freePort()
++  const proxy = await startProxy(deadPort)
++  t.after(() => proxy.stop())
++
++  const response = await request(proxy.port, { path: '/healthz' })
++  assert.equal(response.status, 502)
++  assert.equal(JSON.parse(response.body).ok, false)
++})
++
++test('the shared secret is required for WebSocket upgrades too', { timeout: 30000 }, async (t) => {
++  const backend = await startBackend((_request, response) => {
++    response.writeHead(200)
++    response.end('http')
++  })
++  const proxy = await startProxy(backend.port, { PROXY_SHARED_SECRET: 's3cret-value' })
++  t.after(async () => { await proxy.stop(); await backend.close() })
++
++  const handshake = (headers) => new Promise((resolve) => {
++    const socket = net.connect(proxy.port, '127.0.0.1', () => {
++      socket.write(
++        'GET /api/remote.mux HTTP/1.1\r\n' +
++        `Host: ${ALLOWED_HOST}\r\n` +
++        'Origin: http://dsh.example.com\r\n' +
++        'Upgrade: websocket\r\nConnection: Upgrade\r\n' +
++        'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n' +
++        headers.map(([name, value]) => `${name}: ${value}\r\n`).join('') +
++        '\r\n',
++      )
++    })
++    let received = ''
++    socket.on('data', (chunk) => {
++      received += chunk
++      if (received.includes('\r\n\r\n')) {
++        socket.destroy()
++        resolve(received.split('\r\n')[0])
++      }
++    })
++    socket.on('error', () => resolve(received.split('\r\n')[0] ?? ''))
++    setTimeout(() => socket.destroy(), 3000)
++  })
++
++  assert.match(await handshake([]), /^HTTP\/1\.1 403/)
++  assert.match(await handshake([['X-DSH-Proxy-Secret', 's3cret-value']]), /^HTTP\/1\.1 101/)
++})
++
++test('SIGTERM drains an open WebSocket and exits 0', { timeout: 30000 }, async (t) => {
++  const backend = await startBackend((_request, response) => {
++    response.writeHead(200)
++    response.end('http')
++  })
++  const proxy = await startProxy(backend.port)
++  t.after(() => backend.close())
++
++  const socket = net.connect(proxy.port, '127.0.0.1', () => {
++    socket.write(
++      'GET /api/remote.mux HTTP/1.1\r\n' +
++      `Host: ${ALLOWED_HOST}\r\n` +
++      'Upgrade: websocket\r\nConnection: Upgrade\r\n' +
++      'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n',
++    )
++  })
++  socket.on('error', () => {})
++  await once(socket, 'data')
++
++  const exited = once(proxy.child, 'exit')
++  proxy.child.kill('SIGTERM')
++  const [code] = await exited
++  socket.destroy()
++  assert.equal(code, 0)
++})
++
++test('proxy rejects duplicate Host headers and connection-nominated hop headers', { timeout: 30000 }, async (t) => {
++  const backend = await startBackend((_request, response) => {
++    response.writeHead(200)
++    response.end('ok')
++  })
++  const proxy = await startProxy(backend.port)
++  t.after(async () => { await proxy.stop(); await backend.close() })
++
++  const raw = (payload) => new Promise((resolve) => {
++    const socket = net.connect(proxy.port, '127.0.0.1', () => socket.write(payload))
++    let received = ''
++    const finish = () => { socket.destroy(); resolve(received) }
++    socket.on('data', (chunk) => {
++      received += chunk
++      if (received.includes('\r\n\r\n')) setTimeout(finish, 50)
++    })
++    socket.on('close', () => resolve(received))
++    socket.on('error', () => resolve(received))
++    setTimeout(finish, 3000)
++  })
++
++  const duplicated = await raw(
++    'GET /x HTTP/1.1\r\nHost: dsh.example.com\r\nHost: dsh.example.com\r\n\r\n',
++  )
++  assert.match(duplicated, /^HTTP\/1\.1 400/)
++  assert.equal(backend.requests.length, 0)
++
++  const nominated = await raw(
++    'GET /x HTTP/1.1\r\nHost: dsh.example.com\r\nConnection: keep-alive, X-Secret-Hop\r\n' +
++    'X-Secret-Hop: leak\r\nX-Forwarded-For: 1.2.3.4\r\n\r\n',
++  )
++  assert.match(nominated, /^HTTP\/1\.1 200/)
++  const [seen] = backend.requests
++  assert.equal(seen.headers['x-secret-hop'], undefined, 'Connection-nominated header must be dropped')
++  assert.equal(seen.headers['x-forwarded-for'], undefined, 'client forwarding headers must be dropped')
++})
++
++test('proxy strips upstream Server headers', { timeout: 30000 }, async (t) => {
++  const backend = await startBackend((_request, response) => {
++    response.writeHead(200, { server: 'secret-version', 'x-powered-by': 'secret-framework' })
++    response.end('ok')
++  })
++  const proxy = await startProxy(backend.port)
++  t.after(async () => { await proxy.stop(); await backend.close() })
++
++  const response = await request(proxy.port, { path: '/' })
++  assert.equal(response.headers.server, undefined)
++  assert.equal(response.headers['x-powered-by'], undefined)
++})
++
++test('healthz survives a backend that sends headers then stalls', { timeout: 30000 }, async (t) => {
++  // Regression: the probe must never write a second response (ERR_HTTP_HEADERS_SENT).
++  const backend = http.createServer((_request, response) => {
++    response.writeHead(200, { 'content-type': 'text/plain' })
++    response.write('x')
++    // never ends
++  })
++  backend.listen(0, '127.0.0.1')
++  await once(backend, 'listening')
++  t.after(() => new Promise((resolve) => {
++    backend.closeAllConnections?.()
++    backend.close(resolve)
++  }))
++  const proxy = await startProxy(backend.address().port)
++  t.after(() => proxy.stop())
++
++  const first = await request(proxy.port, { path: '/healthz' })
++  assert.equal(first.status, 200)
++  await new Promise((resolve) => setTimeout(resolve, 2500))
++  assert.equal(proxy.child.exitCode, null, 'proxy must stay alive after a healthz probe timeout')
++  const second = await request(proxy.port, { path: '/healthz' })
++  assert.equal(second.status, 200)
++})
++
++test('proxy forwards large bodies intact', { timeout: 30000 }, async (t) => {
++  const backend = await startBackend((_request, response, { body }) => {
++    response.writeHead(200, { 'content-type': 'application/json' })
++    response.end(JSON.stringify({ bytes: Buffer.byteLength(body) }))
++  })
++  const proxy = await startProxy(backend.port)
++  t.after(async () => { await proxy.stop(); await backend.close() })
++
++  const payload = Buffer.alloc(4 * 1024 * 1024, 0x61)
++  const response = await request(proxy.port, {
++    method: 'POST',
++    path: '/api/session/uploadFileBinary',
++    headers: { 'Content-Type': 'application/octet-stream' },
++    body: payload,
++  })
++  assert.equal(response.status, 200)
++  assert.equal(JSON.parse(response.body).bytes, payload.length)
+ })
+-- 
+2.47.3
+

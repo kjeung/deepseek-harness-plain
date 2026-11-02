@@ -1,0 +1,6 @@
+# Keep the build context small; every image in this repository is built from the
+# repository root and only copies the directory named by its own Dockerfile.
+.git
+.github
+.gitignore
+**/.DS_Store
