@@ -64,7 +64,11 @@ git -C runtime checkout plain-http
 #   并删掉 compose 里的 build: 与 pull_policy: 段
 ```
 
-补丁的基线、校验方式、推到自有 fork、上游更新后 rebase 等细节见 [patches/README.md](patches/README.md)。
+补丁的基线、校验方式、推到自有 fork 等细节见 [patches/README.md](patches/README.md)；
+上游更新后如何同步见 [SYNC-UPSTREAM.md](SYNC-UPSTREAM.md)（一行命令：`scripts/sync-upstream.sh`）。
+
+镜像源码的 fork：**https://github.com/kjeung/runtime**（分支 `plain-http`，保留完整上游历史，
+可直接用 GitHub 的 Sync fork / PR）。部署仓库：**https://github.com/kjeung/deepseek-harness-plain**。
 
 ```bash
 cp .env.example .env
@@ -260,7 +264,8 @@ curl -fsS http://127.0.0.1:8080/healthz   # {"ok":true,"backend":200}
 | `docker-compose.yml` | 单容器编排（构建/镜像二选一、健康检查、日志轮转、优雅退出） |
 | `.env.example` | 全部环境变量示例与注释 |
 | `runtime/deepseek-harness/` | 改造后的镜像源码（Dockerfile、entrypoint、node-proxy.mjs、构建期测试）；本地分支 `plain-http` |
-| `patches/` | 改造补丁与 bundle（相对上游基线 `83f5b17`）+ 应用说明 |
+| `patches/` | 改造补丁与 bundle（基线见 `patches/BASE`）+ 应用说明 |
+| `scripts/sync-upstream.sh` | 一键同步上游：rebase → 测试 → 导出补丁 → 刷新部署仓库 |
 | `reports/node-proxy-feasibility.md` | 可行性报告与实测数据 |
 | `notes/implementation-fixes.md` | 独立评审发现的问题与修复/接受记录 |
 | `notes/` | 镜像核查、环境变量审计、Caddy 对照、方案对比 |
