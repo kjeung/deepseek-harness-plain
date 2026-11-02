@@ -1,3 +1,7 @@
+> ⚠️ **本仓库已合并进单一仓库**：[`kjeung/runtime`](https://github.com/kjeung/runtime)（默认分支 `plain-http`）。
+> 镜像源码在 `deepseek-harness/`，部署编排与文档在 `deploy/`（`cd deploy && docker compose up -d --build`）。
+> 本仓库仅保留为历史归档，不再更新。
+
 # DeepSeek Harness 部署指南（明文 HTTP 版，docker compose）
 
 > 本目录是 1Panel 官方镜像 `1panel/deepseek-harness` 的**改造版**：移除了 Caddy、TLS 与登录认证，
