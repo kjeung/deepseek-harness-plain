@@ -4,22 +4,6 @@
 > 改用一个 Node 转发进程，专供「外部反向代理已负责登录认证 + TLS」的部署。
 > 改动源码在 `runtime/deepseek-harness/`，可行性论证与实测见 `reports/node-proxy-feasibility.md`。
 
-
-## 仓库布局（本仓库）
-
-本仓库已经包含改造后的镜像源码快照，**不需要**再打补丁：
-
-| 路径 | 内容 |
-|---|---|
-| `runtime/` | 镜像源码（`deepseek-harness/` + `.github/`），`docker-compose.yml` 的构建上下文 |
-| `docker-compose.yml` / `.env.example` | 部署编排与变量模板 |
-| `patches/` | 相对上游 `1Panel-dev/runtime` 基线 `83f5b17` 的补丁与 bundle（审计/复现用） |
-| `.github/workflows/deepseek-harness-release.yml` | 本仓库的镜像构建工作流（context=`runtime`） |
-| `reports/` / `notes/` / `prototype/` | 可行性报告、评审记录与验证脚本 |
-
-容器镜像的构建与推送：`Actions → Build DeepSeek Harness Image (plain HTTP, from runtime/)`，
-默认发布到 `kjeung/deepseek-harness-plain:<dshVersion>` 与 `:plain`（可在触发时改 `imageName`）。
-
 ## 0. 结论与架构
 
 只需要一个容器。容器内**没有登录、没有证书、没有 Caddy**：
@@ -60,7 +44,11 @@
 下面三种方式任选其一取得「改造后的源码」：
 
 ```bash
-# 方式 A（推荐）：上游源码 + 补丁
+# 方式 0（最省事）：直接克隆已内置改造的仓库（runtime/ 快照已在其中）
+git clone https://github.com/kjeung/deepseek-harness-plain.git dsh-plain
+cd dsh-plain
+
+# 方式 A：上游源码 + 补丁
 git clone --branch dev --filter=blob:none --sparse \
   https://github.com/1Panel-dev/runtime.git runtime
 git -C runtime sparse-checkout set deepseek-harness .github
